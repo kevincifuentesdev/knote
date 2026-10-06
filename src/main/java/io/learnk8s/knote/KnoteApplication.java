@@ -1,6 +1,11 @@
 package io.learnk8s.knote;
 
-
+import io.minio.BucketExistsArgs;
+import io.minio.GetObjectArgs;
+import io.minio.MakeBucketArgs;
+import io.minio.MinioClient;
+import io.minio.PutObjectArgs;
+import jakarta.annotation.PostConstruct;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -14,21 +19,22 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.mongodb.core.mapping.Document;
 import org.springframework.data.mongodb.repository.MongoRepository;
+import org.springframework.http.MediaType;
+import org.springframework.http.MediaTypeFactory;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
-import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
-import org.springframework.web.servlet.resource.PathResourceResolver;
 
-import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
@@ -39,11 +45,6 @@ public class KnoteApplication {
     public static void main(String[] args) {
         SpringApplication.run(KnoteApplication.class, args);
     }
-
-}
-
-interface NotesRepository extends MongoRepository<Note, String> {
-
 }
 
 @Document(collection = "notes")
@@ -62,36 +63,34 @@ class Note {
     }
 }
 
-@Configuration
-@EnableConfigurationProperties(KnoteProperties.class)
-class KnoteConfig implements WebMvcConfigurer {
-
-    @Autowired
-    private KnoteProperties properties;
-
-    @Override
-    public void addResourceHandlers(ResourceHandlerRegistry registry) {
-        registry
-                .addResourceHandler("/uploads/**")
-                .addResourceLocations("file:" + properties.getUploadDir())
-                .setCachePeriod(3600)
-                .resourceChain(true)
-                .addResolver(new PathResourceResolver());
-    }
-
+interface NotesRepository extends MongoRepository<Note, String> {
 }
 
 @ConfigurationProperties(prefix = "knote")
 class KnoteProperties {
-    @Value("${uploadDir:/tmp/uploads/}")
-    private String uploadDir;
+    @Value("${minio.host:localhost}")
+    private String minioHost;
+    @Value("${minio.bucket:image-storage}")
+    private String minioBucket;
+    @Value("${minio.access.key:}")
+    private String minioAccessKey;
+    @Value("${minio.secret.key:}")
+    private String minioSecretKey;
+    @Value("${minio.useSSL:false}")
+    private boolean minioUseSSL;
+    @Value("${minio.reconnect.enabled:true}")
+    private boolean minioReconnectEnabled;
 
-    public String getUploadDir() {
-        return uploadDir;
-    }
+    public String getMinioHost() { return minioHost; }
+    public String getMinioBucket() { return minioBucket; }
+    public String getMinioAccessKey() { return minioAccessKey; }
+    public String getMinioSecretKey() { return minioSecretKey; }
+    public boolean isMinioUseSSL() { return minioUseSSL; }
+    public boolean isMinioReconnectEnabled() { return minioReconnectEnabled; }
 }
 
 @Controller
+@EnableConfigurationProperties(KnoteProperties.class)
 class KNoteController {
 
     @Autowired
@@ -99,9 +98,14 @@ class KNoteController {
     @Autowired
     private KnoteProperties properties;
 
-    private Parser parser = Parser.builder().build();
-    private HtmlRenderer renderer = HtmlRenderer.builder().build();
+    private final Parser parser = Parser.builder().build();
+    private final HtmlRenderer renderer = HtmlRenderer.builder().build();
+    private MinioClient minioClient;
 
+    @PostConstruct
+    public void init() throws InterruptedException {
+        initMinio();
+    }
 
     @GetMapping("/")
     public String index(Model model) {
@@ -122,8 +126,8 @@ class KNoteController {
             return "redirect:/";
         }
         if (upload != null && upload.equals("Upload")) {
-            if (file != null && file.getOriginalFilename() != null &&
-                    !file.getOriginalFilename().isEmpty()) {
+            if (file != null && file.getOriginalFilename() != null
+                    && !file.getOriginalFilename().isEmpty()) {
                 uploadImage(file, description, model);
             }
             getAllNotes(model);
@@ -132,6 +136,17 @@ class KNoteController {
         return "index";
     }
 
+    @GetMapping("/img/{name}")
+    public ResponseEntity<byte[]> getImageByName(@PathVariable String name) throws Exception {
+        try (InputStream in = minioClient.getObject(GetObjectArgs.builder()
+                .bucket(properties.getMinioBucket())
+                .object(name)
+                .build())) {
+            MediaType type = MediaTypeFactory.getMediaType(name)
+                    .orElse(MediaType.APPLICATION_OCTET_STREAM);
+            return ResponseEntity.ok().contentType(type).body(in.readAllBytes());
+        }
+    }
 
     private void getAllNotes(Model model) {
         List<Note> notes = notesRepository.findAll();
@@ -139,27 +154,64 @@ class KNoteController {
         model.addAttribute("notes", notes);
     }
 
-    private void uploadImage(MultipartFile file, String description, Model model) throws Exception {
-        File uploadsDir = new File(properties.getUploadDir());
-        if (!uploadsDir.exists()) {
-            uploadsDir.mkdir();
-        }
-        String fileId = UUID.randomUUID().toString() + "." +
-                file.getOriginalFilename().split("\\.")[1];
-        file.transferTo(new File(properties.getUploadDir() + fileId));
-        model.addAttribute("description",
-                description + " ![](/uploads/" + fileId + ")");
-    }
-
     private void saveNote(String description, Model model) {
         if (description != null && !description.trim().isEmpty()) {
-            //We need to translate markup to HTML
             Node document = parser.parse(description.trim());
             String html = renderer.render(document);
             notesRepository.save(new Note(null, html));
-            //After publish you need to clean up the textarea
             model.addAttribute("description", "");
         }
     }
 
+    private void uploadImage(MultipartFile file, String description, Model model) throws Exception {
+        String original = file.getOriginalFilename();
+        String ext = original.contains(".")
+                ? original.substring(original.lastIndexOf('.') + 1) : "bin";
+        String fileId = UUID.randomUUID() + "." + ext;
+        String contentType = file.getContentType() != null
+                ? file.getContentType() : "application/octet-stream";
+
+        try (InputStream in = file.getInputStream()) {
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(properties.getMinioBucket())
+                    .object(fileId)
+                    .stream(in, file.getSize(), -1)
+                    .contentType(contentType)
+                    .build());
+        }
+        model.addAttribute("description", description + " ![](/img/" + fileId + ")");
+    }
+
+    // Reintenta hasta que MinIO esté disponible (Kubernetes puede arrancar los pods en cualquier orden)
+    private void initMinio() throws InterruptedException {
+        boolean success = false;
+        while (!success) {
+            try {
+                String scheme = properties.isMinioUseSSL() ? "https://" : "http://";
+                minioClient = MinioClient.builder()
+                        .endpoint(scheme + properties.getMinioHost() + ":9000")
+                        .credentials(properties.getMinioAccessKey(), properties.getMinioSecretKey())
+                        .build();
+
+                boolean exists = minioClient.bucketExists(
+                        BucketExistsArgs.builder().bucket(properties.getMinioBucket()).build());
+                if (exists) {
+                    System.out.println("> Bucket already exists.");
+                } else {
+                    minioClient.makeBucket(
+                            MakeBucketArgs.builder().bucket(properties.getMinioBucket()).build());
+                }
+                success = true;
+            } catch (Exception e) {
+                System.out.println("> Minio connection failed: " + e.getMessage());
+                System.out.println("> Minio Reconnect: " + properties.isMinioReconnectEnabled());
+                if (properties.isMinioReconnectEnabled()) {
+                    Thread.sleep(5000);
+                } else {
+                    success = true;
+                }
+            }
+        }
+        System.out.println("> Minio initialized!");
+    }
 }
